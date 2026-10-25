@@ -71,14 +71,43 @@ local function wakesOnInput()
     return isClient() or getNumActivePlayers() > 1
 end
 
--- Trait check supporting both B42 object registry and fallback
+-- Trait check supporting both B42 object registry (with cached lookup) and fallback
+local cachedProneTrait = nil
+local cachedResistantTrait = nil
+
+local function getRegisteredTrait(id)
+    if CharacterTrait and CharacterTrait.get and ResourceLocation and ResourceLocation.of then
+        local ok, trait = pcall(function() return CharacterTrait.get(ResourceLocation.of(id)) end)
+        if ok and trait then return trait end
+    end
+    return nil
+end
+
 local function hasTrait(playerObj, name)
     if not playerObj then return false end
+    if name == "ProneToPassing" then
+        if not cachedProneTrait then
+            cachedProneTrait = getRegisteredTrait("passout:pronetopassing")
+        end
+        if cachedProneTrait then
+            local ok, has = pcall(function() return playerObj:hasTrait(cachedProneTrait) end)
+            if ok and has ~= nil then return has end
+        end
+    elseif name == "ResistantToPassing" then
+        if not cachedResistantTrait then
+            cachedResistantTrait = getRegisteredTrait("passout:resistanttopassing")
+        end
+        if cachedResistantTrait then
+            local ok, has = pcall(function() return playerObj:hasTrait(cachedResistantTrait) end)
+            if ok and has ~= nil then return has end
+        end
+    end
+
     if CharacterTrait and CharacterTrait.get and ResourceLocation and ResourceLocation.of then
         local lower = string.lower(name)
         for _, id in ipairs({ "passout:" .. lower, "passout:" .. name, name }) do
-            local ok, trait = pcall(function() return CharacterTrait.get(ResourceLocation.of(id)) end)
-            if ok and trait then
+            local trait = getRegisteredTrait(id)
+            if trait then
                 local ok2, has = pcall(function() return playerObj:hasTrait(trait) end)
                 if ok2 and has then return true end
             end
@@ -202,6 +231,16 @@ local function clearViewpointBlackout(pnum)
     end
 end
 
+local function setBlackoutOverride(pnum, on)
+    local sm = getSearchMode()
+    if sm and sm.setOverrideSearchManager then
+        sm:setOverrideSearchManager(pnum, on)
+    end
+    if triggerEvent then
+        triggerEvent("OnOverrideSearchManager", on, pnum)
+    end
+end
+
 -- Turn off the black-out post-process for a player and forget the watch/ramp
 -- state. (Does not touch the forced-sleep window - that is cleared on wake.)
 local function clearState(playerObj, md)
@@ -212,8 +251,21 @@ local function clearState(playerObj, md)
         md.poPhase = nil
         md.poPassOutFactor = nil
         md.poStepFactor = nil
-        getSearchMode():setEnabled(playerObj:getPlayerNum(), false)
-        clearViewpointBlackout(playerObj:getPlayerNum())
+        local pnum = playerObj:getPlayerNum()
+        local sm = getSearchMode()
+        if sm then
+            local mode = sm:getSearchModeForPlayer(pnum)
+            if mode then
+                -- Reset search-mode targets back to engine defaults so subsequent foraging is not corrupted
+                if mode.getDarkness then mode:getDarkness():setTargets(0.0, 0.0) end
+                if mode.getBlur then mode:getBlur():setTargets(0.0, 0.0) end
+                if mode.getDesat then mode:getDesat():setTargets(0.0, 0.0) end
+                if mode.getRadius then mode:getRadius():setTargets(50.0, 50.0) end
+            end
+            sm:setEnabled(pnum, false)
+        end
+        setBlackoutOverride(pnum, false)
+        clearViewpointBlackout(pnum)
     end
 end
 
@@ -355,7 +407,8 @@ end
 local function stopHonkingIfDone(playerObj, md)
     if not md.poHonking then return end
     local veh = playerObj:getVehicle()
-    if playerObj:isDead() or not playerObj:isAsleep() or not veh or not veh:isDriver(playerObj) then
+    if playerObj:isDead() or not playerObj:isAsleep() or not veh or not veh:isDriver(playerObj)
+       or veh:getBatteryCharge() <= 0.0 then
         setHorn(playerObj, false)
         md.poHonking = nil
     end
@@ -379,13 +432,19 @@ local function forceSleep(playerObj, md, sv)
         if canDropToGround(playerObj) then dropToGround(playerObj, true) end
     end
 
-    local bedType = PASSOUT_BED_TYPES[sv.passOutSleepQuality or 1] or "floor"
+    local bedType = nil
+    if sv.passOutSleepQuality and sv.passOutSleepQuality > 1 then
+        bedType = PASSOUT_BED_TYPES[sv.passOutSleepQuality]
+    elseif ISWorldObjectContextMenu and ISWorldObjectContextMenu.getBedQuality then
+        bedType = ISWorldObjectContextMenu.getBedQuality(playerObj, nil)
+    end
+    if not bedType then bedType = "floor" end
 
     local fatigue = playerObj:getStats():get(CharacterStat.FATIGUE)
     local sleepFor = ZombRand(fatigue * 10, fatigue * 13) + 1
-    if     bedType == "goodBed" then sleepFor = sleepFor - 1
-    elseif bedType == "badBed"  then sleepFor = sleepFor + 1
-    elseif bedType == "floor"   then sleepFor = sleepFor * 0.7 end
+    if     bedType == "goodBed" or (bedType.contains and bedType:contains("goodBedPillow")) then sleepFor = sleepFor - 1
+    elseif bedType == "badBed"  or (bedType.contains and bedType:contains("badBedPillow"))  then sleepFor = sleepFor + 1
+    elseif bedType == "floor"   or (bedType.contains and bedType:contains("floorPillow"))   then sleepFor = sleepFor * 0.7 end
     if playerObj:hasTrait(CharacterTrait.INSOMNIAC)       then sleepFor = sleepFor * 0.5  end
     if playerObj:hasTrait(CharacterTrait.NEEDS_LESS_SLEEP) then sleepFor = sleepFor * 0.75 end
     if playerObj:hasTrait(CharacterTrait.NEEDS_MORE_SLEEP) then sleepFor = sleepFor * 1.18 end
@@ -435,7 +494,7 @@ local function forceSleep(playerObj, md, sv)
         return
     end
 
-    getSleepingEvent():setPlayerFallAsleep(playerObj, sleepFor)
+    getSleepingEvent():setPlayerFallAsleep(playerObj, math.floor(sleepFor + 0.5))
     UIManager.setFadeBeforeUI(pnum, true)
     UIManager.FadeOut(pnum, 1)
     if IsoPlayer.allPlayersAsleep() then
@@ -508,6 +567,7 @@ local function advancePassingOut(playerObj, md, sv)
     local pnum = playerObj:getPlayerNum()
 
     -- Drive the foraging search-mode post-process as the vignette.
+    setBlackoutOverride(pnum, true)
     local mode = getSearchMode():getSearchModeForPlayer(pnum)
     getSearchMode():setEnabled(pnum, true)
     mode:getBlur():setTargets(f, f)
